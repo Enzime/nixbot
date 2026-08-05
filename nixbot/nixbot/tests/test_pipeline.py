@@ -36,13 +36,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def current_system() -> str:
-    return subprocess.run(
-        ["nix", "eval", "--raw", "--impure", "--expr", "builtins.currentSystem"],
+def _nix_eval(expr: str) -> str:
+    return subprocess.run(  # noqa: S603
+        ["nix", "eval", "--raw", "--impure", "--expr", expr],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def current_system() -> str:
+    return _nix_eval("builtins.currentSystem")
+
+
+def store_dir() -> str:
+    return _nix_eval("builtins.storeDir")
 
 
 FLAKE_TEMPLATE = """
@@ -188,4 +196,4 @@ async def test_cached_skip_on_second_run(flake: Path, tmp_path: Path) -> None:
     assert f"checks.{system}.dependent" not in executor.built
     # Skipped jobs still expose out paths for gcroots/outputs updates.
     skipped = dict(result.skipped_out_paths)
-    assert skipped[f"checks.{system}.base"].startswith("/nix/store/")
+    assert skipped[f"checks.{system}.base"].startswith(f"{store_dir()}/")
