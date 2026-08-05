@@ -22,4 +22,6 @@ in
   nixbot = import ./nixbot.nix checkArgs;
   nixbot-gitlab = import ./nixbot-gitlab.nix checkArgs;
   nixbot-workload-identity = import ./nixbot-workload-identity.nix checkArgs;
+
+  nixbot-effects-tests = self.packages.${pkgs.stdenv.hostPlatform.system}.nixbot-effects.tests.pytest;
 }
