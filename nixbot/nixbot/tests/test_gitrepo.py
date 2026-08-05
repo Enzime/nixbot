@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import time
 from typing import TYPE_CHECKING
 
@@ -227,14 +226,16 @@ async def test_cleanup_prunes_stale_pr_refs(
     """PR refs accumulate forever otherwise: --prune only covers the
     refspecs of the current fetch."""
     sha = git(upstream, "rev-parse", "HEAD")
-    old_env = {
-        "GIT_COMMITTER_DATE": "2005-04-07T22:13:13",
-        "GIT_AUTHOR_DATE": "2005-04-07T22:13:13",
-    }
-    subprocess.run(  # noqa: S603
-        ["git", "-C", str(upstream), "commit", "--allow-empty", "-m", "old pr"],
-        env={**os.environ, **old_env},
-        check=True,
+    git(
+        upstream,
+        "commit",
+        "--allow-empty",
+        "-m",
+        "old pr",
+        env={
+            "GIT_COMMITTER_DATE": "2005-04-07T22:13:13",
+            "GIT_AUTHOR_DATE": "2005-04-07T22:13:13",
+        },
     )
     old_sha = git(upstream, "rev-parse", "HEAD")
     git(upstream, "update-ref", "refs/pull/1/head", old_sha)

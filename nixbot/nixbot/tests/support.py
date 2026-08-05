@@ -331,7 +331,7 @@ def ephemeral_postgres(
         proc.wait()
 
 
-def git(repo: Path, *args: str) -> str:
+def git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
     """Run git with a hermetic identity/config environment."""
     return subprocess.run(  # noqa: S603
         ["git", "-C", str(repo), *args],
@@ -346,6 +346,7 @@ def git(repo: Path, *args: str) -> str:
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            **(env or {}),
         },
     ).stdout.strip()
 
