@@ -3,6 +3,7 @@ eval fan-out, cached skip, failure aggregation."""
 
 from __future__ import annotations
 
+import functools
 import shutil
 import subprocess
 from typing import TYPE_CHECKING
@@ -36,13 +37,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@functools.cache
 def _nix_eval(expr: str) -> str:
-    return subprocess.run(  # noqa: S603
+    proc = subprocess.run(  # noqa: S603
         ["nix", "eval", "--raw", "--impure", "--expr", expr],
-        check=True,
         capture_output=True,
         text=True,
-    ).stdout.strip()
+        check=False,
+    )
+    if proc.returncode:
+        pytest.fail(
+            f"nix eval {expr} failed ({proc.returncode}): {proc.stderr.strip()}"
+        )
+    return proc.stdout.strip()
 
 
 def current_system() -> str:
