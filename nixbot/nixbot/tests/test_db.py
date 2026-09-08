@@ -69,6 +69,54 @@ async def test_failed_migration_error_not_masked(
         await migrations_mod.apply_migrations(postgres_dsn)
 
 
+async def test_catchup_migration_repairs_pre_0033_schema(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Databases that applied 0028/0029 before b2473dd edited them lack
+    owner, lock and effect_eval_errors; 0033 adds them."""
+    async with db_pool(postgres_dsn) as pool:
+        await pool.execute("CREATE DATABASE db_pre_0033")
+    dsn = postgres_dsn.replace("/db?", "/db_pre_0033?")
+
+    shipped = load_migrations()
+    monkeypatch.setattr(
+        migrations_mod,
+        "load_migrations",
+        lambda: [m for m in shipped if m.version < 33],
+    )
+    await apply_migrations(dsn)
+    async with db_pool(dsn) as pool:
+        await pool.execute(
+            "ALTER TABLE effect_runs DROP COLUMN owner, DROP COLUMN lock"
+        )
+        await pool.execute("DROP TABLE effect_eval_errors")
+
+    monkeypatch.setattr(migrations_mod, "load_migrations", lambda: shipped)
+    await apply_migrations(dsn)
+
+    async with db_pool(dsn) as pool:
+        project_id = await insert_project(pool, "catchup")
+        build_id = await insert_build(pool, project_id)
+        await pool.execute(
+            "INSERT INTO effect_runs (project_id, kind, build_id, schedule_name, name)"
+            " VALUES ($1, 'push', $2, NULL, 'n'), ($1, 'check', $2, NULL, 'n'),"
+            " ($1, 'deployment_status', $2, NULL, 'n'),"
+            " ($1, 'schedule', NULL, 'nightly', 'n')",
+            project_id,
+            build_id,
+        )
+        rows = await pool.fetch(
+            "SELECT kind, owner, lock FROM effect_runs ORDER BY kind"
+        )
+        assert [tuple(r) for r in rows] == [
+            ("check", "build", None),
+            ("deployment_status", "delivery", None),
+            ("push", "build", None),
+            ("schedule", "schedule", None),
+        ]
+        assert await pool.fetchval("SELECT count(*) FROM effect_eval_errors") == 0
+
+
 async def test_huge_attr_name_does_not_break_notify_trigger(pool: asyncpg.Pool) -> None:
     """pg_notify payloads cap at ~8000 bytes. The notify trigger must
     truncate the repo-controlled attr name or every insert/update of
