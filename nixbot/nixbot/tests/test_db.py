@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 
 import asyncpg
@@ -67,6 +68,28 @@ async def test_failed_migration_error_not_masked(
     # rollback/unlock raise on the now-dead connection.
     with pytest.raises(asyncpg.PostgresConnectionError):
         await migrations_mod.apply_migrations(postgres_dsn)
+
+
+async def test_edited_migration_rejected(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An applied script never re-runs, so an edited one must abort startup."""
+    shipped = load_migrations()
+    conn = await _connect(postgres_dsn)
+    try:
+        recorded = await conn.fetchval(
+            "SELECT checksum FROM schema_migrations WHERE version = 1"
+        )
+    finally:
+        await conn.close()
+    assert recorded == shipped[0].checksum
+
+    edited = dataclasses.replace(shipped[0], sql=shipped[0].sql + "\n-- edited")
+    monkeypatch.setattr(
+        migrations_mod, "load_migrations", lambda: [edited, *shipped[1:]]
+    )
+    with pytest.raises(migrations_mod.MigrationError, match=r"0001_initial changed"):
+        await apply_migrations(postgres_dsn)
 
 
 async def test_catchup_migration_repairs_pre_0033_schema(

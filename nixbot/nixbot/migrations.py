@@ -4,7 +4,8 @@ Scripts live in the `migrations/` package directory and are named
 `NNNN_description.sql`. Each script runs in its own transaction. The
 whole run is guarded by a Postgres advisory lock so concurrent service
 starts cannot race. Applied versions are recorded in
-`schema_migrations`.
+`schema_migrations` with a sha256 of the script; a shipped script that
+no longer matches aborts startup, since applied versions never re-run.
 
 asyncpg is used directly (not through SQLAlchemy) because it executes
 multi-statement scripts natively.
@@ -13,6 +14,7 @@ multi-statement scripts natively.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
@@ -35,6 +37,10 @@ class Migration:
     version: int
     name: str
     sql: str
+
+    @property
+    def checksum(self) -> str:
+        return hashlib.sha256(self.sql.encode()).hexdigest()
 
 
 _SCRIPT_RE = re.compile(r"^(\d{4})_(.+)\.sql$")
@@ -62,6 +68,32 @@ def load_migrations() -> list[Migration]:
     return migrations
 
 
+async def _verify_checksums(
+    conn: asyncpg.Connection,
+    migrations: list[Migration],
+    applied: dict[int, str | None],
+) -> None:
+    """Reject shipped scripts that differ from what was applied; record
+    checksums for rows that predate them."""
+    for migration in migrations:
+        if migration.version not in applied:
+            continue
+        recorded = applied[migration.version]
+        if recorded is None:
+            await conn.execute(
+                "UPDATE schema_migrations SET checksum = $2 WHERE version = $1",
+                migration.version,
+                migration.checksum,
+            )
+        elif recorded != migration.checksum:
+            msg = (
+                f"migration {migration.version:04d}_{migration.name} changed "
+                f"after it was applied ({recorded[:12]} -> "
+                f"{migration.checksum[:12]}); add a new migration instead"
+            )
+            raise MigrationError(msg)
+
+
 async def apply_migrations(dsn: str) -> None:
     """Apply all pending migrations to the database at `dsn`."""
     migrations = load_migrations()
@@ -74,14 +106,22 @@ async def apply_migrations(dsn: str) -> None:
                 CREATE TABLE IF NOT EXISTS schema_migrations (
                     version BIGINT PRIMARY KEY,
                     name TEXT NOT NULL,
-                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    checksum TEXT
                 )
                 """
             )
+            # Tables created before checksums were recorded.
+            await conn.execute(
+                "ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT"
+            )
             applied = {
-                row["version"]
-                for row in await conn.fetch("SELECT version FROM schema_migrations")
+                row["version"]: row["checksum"]
+                for row in await conn.fetch(
+                    "SELECT version, checksum FROM schema_migrations"
+                )
             }
+            await _verify_checksums(conn, migrations, applied)
             for migration in migrations:
                 if migration.version in applied:
                     continue
@@ -100,9 +140,13 @@ async def apply_migrations(dsn: str) -> None:
                 try:
                     await conn.execute(migration.sql)
                     await conn.execute(
-                        "INSERT INTO schema_migrations (version, name) VALUES ($1, $2)",
+                        """
+                        INSERT INTO schema_migrations (version, name, checksum)
+                        VALUES ($1, $2, $3)
+                        """,
                         migration.version,
                         migration.name,
+                        migration.checksum,
                     )
                 except BaseException:
                     with contextlib.suppress(Exception):
