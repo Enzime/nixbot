@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 
 import asyncpg
@@ -67,6 +68,76 @@ async def test_failed_migration_error_not_masked(
     # rollback/unlock raise on the now-dead connection.
     with pytest.raises(asyncpg.PostgresConnectionError):
         await migrations_mod.apply_migrations(postgres_dsn)
+
+
+async def test_edited_migration_rejected(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An applied script never re-runs, so an edited one must abort startup."""
+    shipped = load_migrations()
+    conn = await _connect(postgres_dsn)
+    try:
+        recorded = await conn.fetchval(
+            "SELECT checksum FROM schema_migrations WHERE version = 1"
+        )
+    finally:
+        await conn.close()
+    assert recorded == shipped[0].checksum
+
+    edited = dataclasses.replace(shipped[0], sql=shipped[0].sql + "\n-- edited")
+    monkeypatch.setattr(
+        migrations_mod, "load_migrations", lambda: [edited, *shipped[1:]]
+    )
+    with pytest.raises(migrations_mod.MigrationError, match=r"0001_initial changed"):
+        await apply_migrations(postgres_dsn)
+
+
+async def test_catchup_migration_repairs_pre_0033_schema(
+    postgres_dsn: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Databases that applied 0028/0029 before b2473dd edited them lack
+    owner, lock and effect_eval_errors; 0033 adds them."""
+    async with db_pool(postgres_dsn) as pool:
+        await pool.execute("CREATE DATABASE db_pre_0033")
+    dsn = postgres_dsn.replace("/db?", "/db_pre_0033?")
+
+    shipped = load_migrations()
+    monkeypatch.setattr(
+        migrations_mod,
+        "load_migrations",
+        lambda: [m for m in shipped if m.version < 33],
+    )
+    await apply_migrations(dsn)
+    async with db_pool(dsn) as pool:
+        await pool.execute(
+            "ALTER TABLE effect_runs DROP COLUMN owner, DROP COLUMN lock"
+        )
+        await pool.execute("DROP TABLE effect_eval_errors")
+
+    monkeypatch.setattr(migrations_mod, "load_migrations", lambda: shipped)
+    await apply_migrations(dsn)
+
+    async with db_pool(dsn) as pool:
+        project_id = await insert_project(pool, "catchup")
+        build_id = await insert_build(pool, project_id)
+        await pool.execute(
+            "INSERT INTO effect_runs (project_id, kind, build_id, schedule_name, name)"
+            " VALUES ($1, 'push', $2, NULL, 'n'), ($1, 'check', $2, NULL, 'n'),"
+            " ($1, 'deployment_status', $2, NULL, 'n'),"
+            " ($1, 'schedule', NULL, 'nightly', 'n')",
+            project_id,
+            build_id,
+        )
+        rows = await pool.fetch(
+            "SELECT kind, owner, lock FROM effect_runs ORDER BY kind"
+        )
+        assert [tuple(r) for r in rows] == [
+            ("check", "build", None),
+            ("deployment_status", "delivery", None),
+            ("push", "build", None),
+            ("schedule", "schedule", None),
+        ]
+        assert await pool.fetchval("SELECT count(*) FROM effect_eval_errors") == 0
 
 
 async def test_huge_attr_name_does_not_break_notify_trigger(pool: asyncpg.Pool) -> None:
